@@ -3,13 +3,14 @@ use log::{error,warn,info,debug,trace};
 use memmap2::Mmap;
 use hashbrown::HashMap;
 use lazy_static::lazy_static;
+use num_format::{Locale, ToFormattedString};
 use strum::IntoEnumIterator; // Import the trait for iterating over enums
 use strum_macros::{EnumIter, EnumString, IntoStaticStr}; // Derive macro for generating iterator
 use std::collections::{BTreeMap,HashSet};
 use std::error::Error;
 use std::fs::File;
 use std::{io};
-use std::io::Write;
+// use std::io::Write; 
 use csv::Writer;
 use serde::{Serialize, Deserialize, Serializer, Deserializer};
 use serde::ser::SerializeMap;
@@ -24,8 +25,29 @@ pub enum SerializationFormat {
     MsgPack,
 }
 
+#[derive(Debug)]
+pub enum OptionType {
+    None,
+    Call,
+    Put,
+    Both,
+}
+
+impl std::str::FromStr for OptionType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "c" | "call" => Ok(OptionType::Call),
+            "p" | "put" => Ok(OptionType::Put),
+            "both" => Ok(OptionType::Both),
+            _ => Err(()),
+        }
+    }
+}
+
 pub struct Config {
-    pub file_path: String,
+    pub pitch_data_file_path: String,
     pub format: SerializationFormat,
     pub output_file_path: String,
     pub summary_only: bool,
@@ -40,13 +62,35 @@ pub struct Config {
     pub input_file_provided: bool,
     pub input_file_path: String,
     pub verbose: bool,
+    pub option_type: OptionType,
+    pub option_strike_prices: Vec<f64>,
+    pub option_expiry_date: String,
 }
 
 impl Config {
     // Constructor to create a new Config instance
-    pub fn new(file_path: &str, format: SerializationFormat, output_file_path: &str,  summary_only: bool, instruments_file_provided: bool, instruments_file_path: String, osi_root_provided: bool, osi_root: String, dump_file_provided: bool, dump_file: String, top_of_book_provided: bool, top_of_book_file: String, input_file_provided: bool, input_file_path: String, verbose: bool) -> Self { 
+    pub fn new(
+        pitch_data_file_path: &str,
+        format: SerializationFormat,
+        output_file_path: &str,
+        summary_only: bool,
+        instruments_file_provided: bool,
+        instruments_file_path: String,
+        osi_root_provided: bool,
+        osi_root: String,
+        dump_file_provided: bool,
+        dump_file: String,
+        top_of_book_provided: bool,
+        top_of_book_file: String,
+        input_file_provided: bool,
+        input_file_path: String,
+        verbose: bool,
+        option_type: OptionType,
+        option_strike_prices: Vec<f64>,
+        option_expiry_date: String,
+    ) -> Self {
         Self {
-            file_path: file_path.to_string(),
+            pitch_data_file_path: pitch_data_file_path.to_string(),
             format,
             output_file_path: output_file_path.to_string(),
             summary_only,
@@ -61,6 +105,9 @@ impl Config {
             input_file_provided,
             input_file_path,
             verbose,
+            option_type,
+            option_strike_prices,
+            option_expiry_date,
         }
     }
 }
@@ -382,33 +429,24 @@ fn process_add_order(
     let order = Order::new(symbol, side, quantity, price);
     market_state.order_map.add_order(order_id, order);
 
-    if let Some(symbol_mapping) = market_state.symbol_map.get(&symbol) {
-        trace!(
-            "Adding order: id = {}, symbol = {}, osi_root = {}, side = {}, quantity = {}, price = {}",
-            order_id,
-            String::from_utf8_lossy(&symbol),
-            symbol_mapping.osi_root,
-            side,
-            quantity,
-            price
-        );
-    } else {
-        trace!(
-            "Adding order: id = {}, symbol = {}, osi_root = <unknown>, side = {}, quantity = {}, price = {}",
-            order_id,
-            String::from_utf8_lossy(&symbol),
-            side,
-            quantity,
-            price
-        );
-    }
-
     if !config.summary_only {
         if !market_state.filtering || market_state.filtered_symbols.contains(&symbol) {
+            if let Some(symbol_mapping) = market_state.symbol_map.get(&symbol) {
+                trace!(
+                    "Adding order: id = {}, symbol = {}, osi_root = {}, side = {}, quantity = {}, price = {}",
+                    order_id,
+                    String::from_utf8_lossy(&symbol),
+                    symbol_mapping.osi_root,
+                    side,
+                    quantity,
+                    price
+                );
+            }
+
             let instrument_market = market_state
-                .instrument_markets
-                .entry(symbol)
-                .or_insert_with(InstrumentMarket::new);
+            .instrument_markets
+            .entry(symbol)
+            .or_insert_with(InstrumentMarket::new);
 
             let old_best_bid = instrument_market.highest_bid();
             let old_best_offer = instrument_market.lowest_offer();
@@ -423,6 +461,7 @@ fn process_add_order(
             let new_best_offer = instrument_market.lowest_offer();
 
             if new_best_bid != old_best_bid || new_best_offer != old_best_offer {
+                // Log the market state update
                 let instrument = market_state.symbol_map.get(&symbol);
                 if instrument.is_none() {
                     trace!(
@@ -436,7 +475,6 @@ fn process_add_order(
                     let call_put = instrument.call_put.unwrap_or(' ');
                     let strike = instrument.strike;
 
-                    // Log the market state update
                     if let Some(tob_writer) = &mut market_state.tob_writer {
                         let bid_qty = new_best_bid.map_or(0, |(_, qty)| qty);
                         let bid_price = new_best_bid.map_or(0, |(price, _)| price);
@@ -446,6 +484,10 @@ fn process_add_order(
                         tob_writer.write_record(&[
                             String::from_utf8_lossy(&symbol).to_string(),
                             "AddOrder*".to_string(),
+                            osi_root.to_string(),
+                            expiry.to_string(),
+                            call_put.to_string(),
+                            strike.to_string(),
                             bid_qty.to_string(),
                             bid_price.to_string(),
                             offer_qty.to_string(),
@@ -474,7 +516,7 @@ fn handle_add_order_long(market_state: &mut MarketState, message_payload: &[u8],
     let side = message_payload[12] as char;
     let quantity = u32::from_le_bytes(message_payload[13..17].try_into().unwrap());
     let symbol: [u8; 6] = message_payload[17..23].try_into().unwrap();
-    let price = u64::from_le_bytes(message_payload[23..32].try_into().unwrap());
+    let price = u64::from_le_bytes(message_payload[23..31].try_into().unwrap());
 
     process_add_order(market_state, order_id, side, quantity, symbol, price, config);
 }
@@ -484,7 +526,7 @@ fn handle_add_order_short(market_state: &mut MarketState, message_payload: &[u8]
     let order_id = u64::from_le_bytes(message_payload[4..12].try_into().unwrap());
     let side = message_payload[12] as char;
     let quantity: u32 = u16::from_le_bytes(message_payload[13..15].try_into().unwrap()) as u32;
-    let symbol: [u8; 6] = message_payload[17..23].try_into().unwrap();
+    let symbol: [u8; 6] = message_payload[15..21].try_into().unwrap();
     let price: u64 = u16::from_le_bytes(message_payload[21..23].try_into().unwrap()) as u64;
 
     process_add_order(market_state, order_id, side, quantity, symbol, price, config);
@@ -510,20 +552,37 @@ fn handle_delete_order(market_state: &mut MarketState, message_payload: &[u8], c
                 let new_best_offer = instrument_market.lowest_offer();
 
                 if new_best_bid != old_best_bid || new_best_offer != old_best_offer  {
-                    let instrument = market_state.symbol_map.get(&symbol);
-                    if Some(instrument).is_none() {
-                        trace!("No symbol mapping found for symbol: {}", String::from_utf8_lossy(&symbol));
-                    }
-                    else {
-                        // let osi_root = instrument.unwrap().osi_root.clone();
-                        // let expiry = instrument.unwrap().expiry.clone();
-                        // let call_put = instrument.unwrap().call_put.unwrap_or(' ');
-                        // let strike = instrument.unwrap().strike;                    
+                    // Log the market state update
+                    if let Some(tob_writer) = &mut market_state.tob_writer {
+                        let bid_qty = new_best_bid.map_or(0, |(_, qty)| qty);
+                        let bid_price = new_best_bid.map_or(0, |(price, _)| price);
+                        let offer_qty = new_best_offer.map_or(0, |(_, qty)| qty);
+                        let offer_price = new_best_offer.map_or(0, |(price, _)| price);
 
-                        // // Log the market state update
-                        // trace!("Market state updated for OSI root: {}, expiry: {}, p/c: {}, strike: {}, best bid: {}, best offer: {}",
-                        //     osi_root, expiry, call_put, strike, new_best_bid.map_or("None".to_string(), |(price, qty)| format!("{}@{}", qty, price)),
-                        //     new_best_offer.map_or("None".to_string(), |(price, qty)| format!("{}@{}", qty, price)));
+                        let instrument = market_state.symbol_map.get(&symbol);
+                        if Some(instrument).is_none() {
+                            trace!("No symbol mapping found for symbol: {}", String::from_utf8_lossy(&symbol));
+                        }
+                        else {
+                            let instrument = instrument.unwrap();
+                            let osi_root = instrument.osi_root.clone();
+                            let expiry = instrument.expiry.clone();
+                            let call_put = instrument.call_put.unwrap_or(' ');
+                            let strike = instrument.strike;
+
+                            tob_writer.write_record(&[
+                                String::from_utf8_lossy(&symbol).to_string(),
+                                "AddOrder*".to_string(),
+                                osi_root.to_string(),
+                                expiry.to_string(),
+                                call_put.to_string(),
+                                strike.to_string(),
+                                bid_qty.to_string(),
+                                bid_price.to_string(),
+                                offer_qty.to_string(),
+                                offer_price.to_string(),
+                            ]).unwrap();
+                        }
                     }
                 }
             }
@@ -561,15 +620,17 @@ fn parse(data: &[u8], symbol_mapping: &HashMap<[u8; 6], SymbolMapping>, filtered
 
     if config.top_of_book_provided {
         let mut wtr = csv::Writer::from_path(&config.top_of_book_file)?;
-        wtr.write_record(&["symbol", "event", "bid_qty", "bid_price", "offer_qty", "offer_price"])?;
+        wtr.write_record(&["symbol", "event", "underlying", "type", "strike", "expiry", "bid_qty", "bid_price", "offer_qty", "offer_price"])?;
         market_state.tob_writer = Some(wtr);
     }
 
-    debug!("Filtered symbols count: {}", market_state.filtered_symbols.len());
     debug!("Symbol mapping count: {}", market_state.symbol_map.len());
     if market_state.filtered_symbols.len() > 0 {
         market_state.filtering = true;
         info!("Filtering enabled for symbols matching the OSI root: {}", config.osi_root);
+        if market_state.filtered_symbols.len() < 20 {
+            info!("Symbols: {}", market_state.filtered_symbols.iter().map(|s| String::from_utf8_lossy(s).to_string()).collect::<Vec<_>>().join(", "));
+        }
     } else {
         info!("No symbols match the provided OSI root, filtering is disabled.");
     }
@@ -633,15 +694,17 @@ fn parse(data: &[u8], symbol_mapping: &HashMap<[u8; 6], SymbolMapping>, filtered
     let mut sorted_stats: Vec<_> = message_stats.iter().collect();
     sorted_stats.sort_by_key(|&(message_type, _)| *message_type);
 
-    for (message_type, stats) in &sorted_stats {
-        info!(
-            "Message type: 0x{:02X} ({:?}), count: {}, first offset: {}, total length: {}",
-            message_type,
-            MessageType::from_byte(**message_type).name(),
-            stats.message_count,
-            stats.first_offset,
-            stats.total_length
-        );
+    if config.verbose {
+        for (message_type, stats) in &sorted_stats {
+            info!(
+                "Message type: 0x{:02X} ({:?}), count: {}, first offset: {}, total length: {}",
+                message_type,
+                MessageType::from_byte(**message_type).name(),
+                stats.message_count,
+                stats.first_offset,
+                stats.total_length
+            );
+        }
     }
 
     // Insert into dump_json if dumping is enabled
@@ -657,10 +720,7 @@ fn parse(data: &[u8], symbol_mapping: &HashMap<[u8; 6], SymbolMapping>, filtered
             }));
         }
         dump_json.insert("message_stats".to_string(), serde_json::Value::Array(stats_json));
-    }
 
-
-    if config.dump_file_provided {
         debug!("Inserting unique symbols to JSON dump");
         // As hex strings for [u8; 6] representation, sorted alphabetically
         let mut unique_symbols_hex: Vec<String> = market_state
@@ -687,7 +747,7 @@ fn parse(data: &[u8], symbol_mapping: &HashMap<[u8; 6], SymbolMapping>, filtered
             "Encountered unsupported message types: {}",
             market_state.unsupported_message_types
                 .iter()
-                .map(|t| format!("0x{:02X}", t))
+                .map(|t| format!("0x{:02X} ({:?})", t, MessageType::from_byte(*t).name()))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -699,6 +759,51 @@ fn parse(data: &[u8], symbol_mapping: &HashMap<[u8; 6], SymbolMapping>, filtered
         }
     }
     Ok(())
+}
+
+fn build_filtered_symbols(
+    symbol_mapping: &HashMap<[u8; 6], SymbolMapping>,
+    config: &Config,
+) -> Result<HashSet<[u8; 6]>, Box<dyn Error>> {
+    if config.osi_root_provided {
+        let underlying = &config.osi_root;
+        let option_type = &config.option_type;
+        let expiry = config.option_expiry_date.trim();
+
+        let set: HashSet<[u8; 6]> = symbol_mapping
+            .values()
+            .filter(|row| {
+                // OSI root must match
+                row.osi_root == *underlying &&
+                // Option type must match if not None or Both
+                (matches!(option_type, OptionType::None | OptionType::Both)
+                    || row.call_put.map(|c| {
+                        match option_type {
+                            OptionType::Call => c.eq_ignore_ascii_case(&'C'),
+                            OptionType::Put => c.eq_ignore_ascii_case(&'P'),
+                            _ => true,
+                        }
+                    }).unwrap_or(false)
+                ) &&
+                // Expiry must match if provided (non-empty)
+                (expiry.is_empty() || row.expiry.trim() == expiry) &&
+                // Strike price must match if provided (non-empty Vec)
+                (config.option_strike_prices.is_empty() || config.option_strike_prices.contains(&row.strike))
+            })
+            .map(|row| row.bats_symbol)
+            .collect();
+
+        if set.is_empty() {
+            error!(
+                "No symbols found for the provided underlying: {}, option_type: {:?}, expiry: {}",
+                config.osi_root, config.option_type, config.option_expiry_date
+            );
+            return Err(Box::new(io::Error::new(io::ErrorKind::NotFound, "No matching symbols found")));
+        }
+        Ok(set)
+    } else {
+        Ok(HashSet::new())
+    }
 }
 
 pub fn run(config: &Config) -> Result<(), Box<dyn Error>> {
@@ -734,22 +839,7 @@ pub fn run(config: &Config) -> Result<(), Box<dyn Error>> {
     info!("Loaded {} instruments from file: {}", symbol_mapping.len(), config.instruments_file_path);
 
     // build a set of symbols that match the underlying, if provided
-    let filtered_symbols: HashSet<[u8; 6]> = if config.osi_root_provided {
-        let underlying = &config.osi_root;
-        let set: HashSet<[u8; 6]> = symbol_mapping
-            .values()
-            .filter(|row| row.osi_root == *underlying)
-            .map(|row| row.bats_symbol)
-            .collect();
-
-        if set.is_empty() {
-            error!("No symbols found for the provided underlying: {}", config.osi_root);
-            return Err(Box::new(io::Error::new(io::ErrorKind::NotFound, "No matching symbols found")));
-        }
-        set
-    } else {
-        HashSet::new()
-    };
+    let filtered_symbols = build_filtered_symbols(&symbol_mapping, config)?;
 
     // Insert filtered_symbols into the JSON map (as Vec<String> for readability)
     if config.dump_file_provided {
@@ -761,10 +851,10 @@ pub fn run(config: &Config) -> Result<(), Box<dyn Error>> {
         dump_json.insert("filtered_symbols".to_string(), json!(filtered_vec));
     }
     
-    info!("Filtered symbols count: {}", filtered_symbols.len());
+    info!("Filtered symbols count: {}", filtered_symbols.len().to_formatted_string(&Locale::en));
 
     // Open the data file
-    let file = File::open(config.file_path.to_string()).map_err(|err| {
+    let file = File::open(config.pitch_data_file_path.to_string()).map_err(|err| {
         error!("Error opening file: {}", err);
         err
     })?;
