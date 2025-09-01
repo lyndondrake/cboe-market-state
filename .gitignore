@@ -5,3 +5,8 @@ Cargo.lock
 **/*.rs.bk
 *.code-workspace
 *.pdb
+dump-2023-10-23.json
+dump.json
+test.txt
+tob-init.csv
+tob.csv
