@@ -28,5 +28,12 @@ strum = "0.27.1"
 strum_macros = "0.27.1"
 
 [profile.dev]
-debug = true
+debug = 2
 opt-level = 1
+split-debuginfo = "unpacked"   # important on macOS so LLDB finds the dSYM
+lto = false
+codegen-units = 256
+
+[profile.release]
+debug = 1
+opt-level = 3

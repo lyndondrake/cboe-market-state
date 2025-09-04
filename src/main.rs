@@ -27,13 +27,17 @@ struct Args {
     #[arg(short = 'o', long = "output-file", value_name = "OUTPUT_FILE")]
     output_file: Option<String>,
 
-    /// Sets an input file for deserialising market state
+    /// Sets an input file for de-serialising market state
     #[arg(short = 'i', long = "input-file", value_name = "INPUT_FILE")]
     input_file: Option<String>,
 
     /// Serialization format (json or msgpack)
     #[arg(short = 'f', long = "format", value_name = "FORMAT", default_value = "json")]
     format: String,
+
+    /// Limit processing to first N add messages (accounting for filtered symbols)
+    #[arg(short = 'l', long = "limit", value_name = "LIMIT", default_value = "0")]
+    limit: usize,
 
     /// Skip building market state and only collect statistics
     #[arg(short = 'q', long = "quick-summary-only")]
@@ -47,7 +51,6 @@ struct Args {
     #[arg(short = 'r', long = "osi-root", value_name = "OSI_ROOT")]
     osi_root: Option<String>,
 
-    /// Option series
     /// Type of option
     #[arg(short = 't', long = "option-type", value_name = "OPTION_TYPE" )]
     option_type: Option<String>,
@@ -111,7 +114,8 @@ fn main() {
         args.verbose,
         option_type,
         strike_prices,
-        args.option_expiry_date.as_deref().unwrap_or("").to_string()
+        args.option_expiry_date.as_deref().unwrap_or("").to_string(),
+        args.limit,
     );
     let result = run(&config);
 

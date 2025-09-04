@@ -5,12 +5,13 @@ use hashbrown::HashMap;
 use lazy_static::lazy_static;
 use num_format::{Locale, ToFormattedString};
 use strum::IntoEnumIterator; // Import the trait for iterating over enums
-use strum_macros::{EnumIter, EnumString, IntoStaticStr}; // Derive macro for generating iterator
+use strum_macros::{EnumIter, EnumString, IntoStaticStr}; use core::time;
+// Derive macro for generating iterator
 use std::collections::{BTreeMap,HashSet};
+use std::collections::btree_map::Entry;
 use std::error::Error;
 use std::fs::File;
 use std::{io};
-// use std::io::Write; 
 use csv::Writer;
 use serde::{Serialize, Deserialize, Serializer, Deserializer};
 use serde::ser::SerializeMap;
@@ -18,6 +19,8 @@ use serde::de::{self, MapAccess, Visitor};
 use std::fmt;
 use rmp_serde::{encode::write_named, decode::from_read};
 use serde_json::{to_writer, json, Map, Value};
+use std::rc::Rc;
+use std::cell::RefCell;
 
 #[derive(Clone)]
 pub enum SerializationFormat {
@@ -65,6 +68,7 @@ pub struct Config {
     pub option_type: OptionType,
     pub option_strike_prices: Vec<f64>,
     pub option_expiry_date: String,
+    pub limit: usize, // 0 means no limit
 }
 
 impl Config {
@@ -88,6 +92,7 @@ impl Config {
         option_type: OptionType,
         option_strike_prices: Vec<f64>,
         option_expiry_date: String,
+        limit: usize,
     ) -> Self {
         Self {
             pitch_data_file_path: pitch_data_file_path.to_string(),
@@ -103,11 +108,12 @@ impl Config {
             top_of_book_provided,
             top_of_book_file,
             input_file_provided,
-            input_file_path,
+            input_file_path: input_file_path.to_string(),
             verbose,
             option_type,
             option_strike_prices,
             option_expiry_date,
+            limit,
         }
     }
 }
@@ -264,29 +270,255 @@ impl OrderMap {
 
 #[derive(Serialize, Deserialize)]
 struct InstrumentMarket {
-    // for a given instrument, the bids are a mapping from price u64 to a list of quantities at that price in the order of insertion
-    // TODO: are there other aspects of the order book that must be preserved: (a) how is top-of-book determined e.g. does modifying an order push that order to the bottom of the priority queue? (b) can priority be modified in other ways which means that this should store Order objects rather than just quantities which would use more space but be more flexible?
     bids: BTreeMap<u64, Vec<u32>>,
     offers: BTreeMap<u64, Vec<u32>>,
+    #[serde(skip)]
+    tob_writer: Option<Rc<RefCell<Writer<std::fs::File>>>>,
+    #[serde(skip)]
+    best_bid: Option<(u64, u32)>,
+    #[serde(skip)]
+    best_offer: Option<(u64, u32)>,
 }
 
 impl InstrumentMarket {
-    fn new() -> Self {
+    // fn new() -> Self {
+    //     InstrumentMarket {
+    //         bids: BTreeMap::new(),
+    //         offers: BTreeMap::new(),
+    //         tob_writer: None,
+    //     }
+    // }
+
+    fn new_with_writer(tob_writer: Option<Rc<RefCell<Writer<std::fs::File>>>>) -> Self {
         InstrumentMarket {
             bids: BTreeMap::new(),
             offers: BTreeMap::new(),
+            tob_writer,
+            best_bid: None,
+            best_offer: None,
         }
     }
 
-    fn add_bid(&mut self, price: u64, quantity: u32) {
+    // Return the highest bid as (price, total_quantity) or None if no bids
+    fn highest_bid(&self) -> Option<(u64, u32)> {
+        self.bids
+            .iter()
+            .next_back()
+            .map(|(price, qtys)| (*price, qtys.iter().copied().sum()))
+    }
+
+    // Return the lowest offer as (price, total_quantity) or None if no offers
+    fn lowest_offer(&self) -> Option<(u64, u32)> {
+        self.offers
+            .iter()
+            .next()
+            .map(|(price, qtys)| (*price, qtys.iter().copied().sum()))
+    }
+
+    // Recompute bests from the books
+    fn recompute_best(&self) -> (Option<(u64, u32)>, Option<(u64, u32)>) {
+        (self.highest_bid(), self.lowest_offer())
+    }
+
+    // Centralized TOB emission helper. Also updates stored bests.
+    // TODO: split into separate emit and update functions?
+    // TODO: output time in CSV as full date time + fractional seconds
+    fn maybe_emit_tob_change(
+        &mut self,
+        time_reference: u32,
+        time_offset: u32,
+        old_best_bid: Option<(u64, u32)>,
+        old_best_offer: Option<(u64, u32)>,
+        new_best_bid: Option<(u64, u32)>,
+        new_best_offer: Option<(u64, u32)>,
+        symbol: &[u8; 6],
+        instrument: Option<&SymbolMapping>,
+        event: &str,
+    ) {
+        if new_best_bid != old_best_bid || new_best_offer != old_best_offer {
+            if let Some(instr) = instrument {
+                let (bid_price_str, bid_qty_str) = if let Some((price, qty)) = new_best_bid {
+                    (price.to_string(), qty.to_string())
+                } else {
+                    (String::new(), String::new())
+                };
+                let (offer_price_str, offer_qty_str) = if let Some((price, qty)) = new_best_offer {
+                    (price.to_string(), qty.to_string())
+                } else {
+                    (String::new(), String::new())
+                };
+
+                if let Some(rc) = &self.tob_writer {
+                    let mut wtr = rc.borrow_mut();
+                    let osi_root = instr.osi_root.clone();
+                    let expiry = instr.expiry.clone();
+                    let call_put = instr.call_put.unwrap_or(' ');
+                    let strike = instr.strike;
+
+                    wtr.write_record(&[
+                        time_reference.to_string(),
+                        time_offset.to_string(),
+                        String::from_utf8_lossy(symbol).to_string(),
+                        event.to_string(),
+                        osi_root.to_string(),
+                        expiry.to_string(),
+                        call_put.to_string(),
+                        strike.to_string(),
+                        bid_qty_str,
+                        bid_price_str,
+                        offer_price_str,
+                        offer_qty_str,
+                    ]).unwrap();
+                }
+
+                trace!(
+                    "Market state updated for OSI root: {}, expiry: {}, p/c: {}, strike: {}, best bid: {}, best offer: {}",
+                    instr.osi_root,
+                    instr.expiry,
+                    instr.call_put.unwrap_or(' '),
+                    instr.strike,
+                    new_best_bid.map_or("None".to_string(), |(p, q)| format!("{}@{}", q, p)),
+                    new_best_offer.map_or("None".to_string(), |(p, q)| format!("{}@{}", q, p))
+                );
+            } else {
+                trace!("No symbol mapping found for symbol: {}", String::from_utf8_lossy(symbol));
+            }
+        }
+
+        // Persist the new bests
+        self.best_bid = new_best_bid;
+        self.best_offer = new_best_offer;
+    }
+
+    fn add_bid(
+        &mut self,
+        time_reference: u32,
+        time_offset: u32,
+        price: u64,
+        quantity: u32,
+        symbol: &[u8; 6],
+        instrument: Option<&SymbolMapping>,
+    ) {
+        let old_best_bid = self.best_bid;
+        let old_best_offer = self.best_offer;
+
         self.bids.entry(price).or_insert_with(Vec::new).push(quantity);
+
+        let (new_best_bid, new_best_offer) = self.recompute_best();
+        self.maybe_emit_tob_change(
+            time_reference,
+            time_offset,
+            old_best_bid,
+            old_best_offer,
+            new_best_bid,
+            new_best_offer,
+            symbol,
+            instrument,
+            "AddOrder*",
+        );
     }
 
-    fn add_offer(&mut self, price: u64, quantity: u32) {
+    fn add_offer(
+        &mut self,
+        time_reference: u32,
+        time_offset: u32,
+        price: u64,
+        quantity: u32,
+        symbol: &[u8; 6],
+        instrument: Option<&SymbolMapping>,
+    ) {
+        let old_best_bid = self.best_bid;
+        let old_best_offer = self.best_offer;
+
         self.offers.entry(price).or_insert_with(Vec::new).push(quantity);
+
+        let (new_best_bid, new_best_offer) = self.recompute_best();
+        self.maybe_emit_tob_change(
+            time_reference,
+            time_offset,
+            old_best_bid,
+            old_best_offer,
+            new_best_bid,
+            new_best_offer,
+            symbol,
+            instrument,
+            "AddOrder*",
+        );
     }
 
-    fn remove_quantity(&mut self, side: char, price: u64, quantity: u32) {
+    fn modify_quantity(
+        &mut self,
+        time_reference: u32,
+        time_offset: u32,
+        side: char,
+        price: u64,
+        new_quantity: u32,
+        prev_quantity: u32,
+        symbol: &[u8; 6],
+        instrument: Option<&SymbolMapping>,
+    ) {
+        let old_best_bid = self.best_bid;
+        let old_best_offer = self.best_offer;
+
+        let price_map = match side {
+            'B' => &mut self.bids,
+            'S' => &mut self.offers,
+            _ => {
+                warn!("Unknown order side in modify_quantity: {}", side);
+                return;
+            }
+        };
+
+        if let Some(level) = price_map.get_mut(&price) {
+            if let Some(pos) = level.iter().position(|&q| q == prev_quantity) {
+                if new_quantity > 0 {
+                    level[pos] = new_quantity;
+                } else {
+                    level.remove(pos);
+                    if level.is_empty() {
+                        price_map.remove(&price);
+                    }
+                }
+            } else {
+                trace!(
+                    "modify_quantity: no matching prev_quantity {} found at price {} for side {}",
+                    prev_quantity, price, side
+                );
+            }
+        } else {
+            trace!(
+                "modify_quantity: no price level {} found for side {}",
+                price, side
+            );
+        }
+
+        let (new_best_bid, new_best_offer) = self.recompute_best();
+        self.maybe_emit_tob_change(
+            time_reference,
+            time_offset,
+            old_best_bid,
+            old_best_offer,
+            new_best_bid,
+            new_best_offer,
+            symbol,
+            instrument,
+            "ModifySize*",
+        );
+    }
+
+    fn remove_quantity(
+        &mut self,
+        time_reference: u32,
+        time_offset: u32,
+        side: char,
+        price: u64,
+        quantity: u32,
+        symbol: &[u8; 6],
+        instrument: Option<&SymbolMapping>,
+    ) {
+        let old_best_bid = self.best_bid;
+        let old_best_offer = self.best_offer;
+
         let price_map = match side {
             'B' => &mut self.bids,
             'S' => &mut self.offers,
@@ -304,35 +536,35 @@ impl InstrumentMarket {
                 price_map.remove(&price);
             }
         }
-    }
 
-    /// Returns the highest bid as (price, total_quantity), or None if no bids.
-    fn highest_bid(&self) -> Option<(u64, u32)> {
-        self.bids.iter().rev().next().map(|(&price, quantities)| {
-            (price, quantities.iter().sum())
-        })
+        let (new_best_bid, new_best_offer) = self.recompute_best();
+        self.maybe_emit_tob_change(
+            time_reference,
+            time_offset,
+            old_best_bid,
+            old_best_offer,
+            new_best_bid,
+            new_best_offer,
+            symbol,
+            instrument,
+            "DeleteOrder",
+        );
     }
-
-    /// Returns the lowest offer as (price, total_quantity), or None if no offers.
-    fn lowest_offer(&self) -> Option<(u64, u32)> {
-        self.offers.iter().next().map(|(&price, quantities)| {
-            (price, quantities.iter().sum())
-        })
-    }    
 }
-
 #[derive(Serialize, Deserialize)]
 struct MarketState {
     order_map: OrderMap,
     #[serde(serialize_with = "serialize_btreemap", deserialize_with = "deserialize_btreemap")]
-    instrument_markets: BTreeMap<[u8; 6], InstrumentMarket>, // mapping from symbol id to the bids and offers
+    instrument_markets: BTreeMap<[u8; 6], InstrumentMarket>,
     unique_symbols: HashSet<[u8; 6]>,
-    symbol_map: HashMap<[u8; 6], SymbolMapping>, // mapping from symbol id to SymbolMapping
-    filtering: bool, // whether to filter symbols based on the OSI root symbol
-    filtered_symbols: HashSet<[u8; 6]>, // symbols that match the OSI root symbol, if provided
-    unsupported_message_types: HashSet<u8>, // unsupported message types encountered
+    symbol_map: HashMap<[u8; 6], SymbolMapping>,
+    filtering: bool,
+    filtered_symbols: HashSet<[u8; 6]>,
+    unsupported_message_types: HashSet<u8>,
     #[serde(skip)]
-    pub tob_writer: Option<Writer<std::fs::File>>,
+    pub tob_writer: Option<Rc<RefCell<Writer<std::fs::File>>>>, // changed to shared handle
+    add_messages_count: usize,
+    time_reference: u32,
 }
 
 impl MarketState {
@@ -346,6 +578,8 @@ impl MarketState {
             filtered_symbols: HashSet::new(),
             unsupported_message_types: HashSet::new(),
             tob_writer: None,
+            add_messages_count: 0,
+            time_reference: 0,
         }
     }
 
@@ -417,6 +651,7 @@ where
 
 fn process_add_order(
     market_state: &mut MarketState,
+    time_offset: u32,
     order_id: u64,
     side: char,
     quantity: u32,
@@ -426,113 +661,88 @@ fn process_add_order(
 ) {
     market_state.unique_symbols.insert(symbol);
 
-    let order = Order::new(symbol, side, quantity, price);
-    market_state.order_map.add_order(order_id, order);
+    if !config.summary_only && (!market_state.filtering || market_state.filtered_symbols.contains(&symbol)) {
+        if market_state.add_messages_count > config.limit && config.limit > 0 {
+            return;
+        }
+        market_state.add_messages_count += 1;
 
-    if !config.summary_only {
-        if !market_state.filtering || market_state.filtered_symbols.contains(&symbol) {
-            if let Some(symbol_mapping) = market_state.symbol_map.get(&symbol) {
-                trace!(
-                    "Adding order: id = {}, symbol = {}, osi_root = {}, side = {}, quantity = {}, price = {}",
-                    order_id,
-                    String::from_utf8_lossy(&symbol),
-                    symbol_mapping.osi_root,
-                    side,
-                    quantity,
-                    price
-                );
+        let order = Order::new(symbol, side, quantity, price);
+        market_state.order_map.add_order(order_id, order);
+        
+        // Look up instrument mapping before mutable borrow of instrument_markets
+        let instrument_info = market_state.symbol_map.get(&symbol);
+
+        let instrument_market = match market_state.instrument_markets.entry(symbol) {
+            Entry::Occupied(e) => {
+                e.into_mut()
             }
-
-            let instrument_market = market_state
-            .instrument_markets
-            .entry(symbol)
-            .or_insert_with(InstrumentMarket::new);
-
-            let old_best_bid = instrument_market.highest_bid();
-            let old_best_offer = instrument_market.lowest_offer();
-
-            match side {
-                'B' => instrument_market.add_bid(price, quantity),
-                'S' => instrument_market.add_offer(price, quantity),
-                _ => warn!("Unknown order side: {}", side),
+            Entry::Vacant(v) => {
+                trace!("Inserting new InstrumentMarket for symbol hex={}", hex::encode(symbol));
+                v.insert(InstrumentMarket::new_with_writer(market_state.tob_writer.clone()))
             }
+        };
 
-            let new_best_bid = instrument_market.highest_bid();
-            let new_best_offer = instrument_market.lowest_offer();
-
-            if new_best_bid != old_best_bid || new_best_offer != old_best_offer {
-                // Log the market state update
-                let instrument = market_state.symbol_map.get(&symbol);
-                if instrument.is_none() {
-                    trace!(
-                        "No symbol mapping found for symbol: {}",
-                        String::from_utf8_lossy(&symbol)
-                    );
-                } else {
-                    let instrument = instrument.unwrap();
-                    let osi_root = instrument.osi_root.clone();
-                    let expiry = instrument.expiry.clone();
-                    let call_put = instrument.call_put.unwrap_or(' ');
-                    let strike = instrument.strike;
-
-                    if let Some(tob_writer) = &mut market_state.tob_writer {
-                        let bid_qty = new_best_bid.map_or(0, |(_, qty)| qty);
-                        let bid_price = new_best_bid.map_or(0, |(price, _)| price);
-                        let offer_qty = new_best_offer.map_or(0, |(_, qty)| qty);
-                        let offer_price = new_best_offer.map_or(0, |(price, _)| price);
-
-                        tob_writer.write_record(&[
-                            String::from_utf8_lossy(&symbol).to_string(),
-                            "AddOrder*".to_string(),
-                            osi_root.to_string(),
-                            expiry.to_string(),
-                            call_put.to_string(),
-                            strike.to_string(),
-                            bid_qty.to_string(),
-                            bid_price.to_string(),
-                            offer_qty.to_string(),
-                            offer_price.to_string(),
-                        ]).unwrap();
-                    }
-
-                    trace!(
-                        "Market state updated for OSI root: {}, expiry: {}, p/c: {}, strike: {}, best bid: {}, best offer: {}",
-                        osi_root,
-                        expiry,
-                        call_put,
-                        strike,
-                        new_best_bid.map_or("None".to_string(), |(price, qty)| format!("{}@{}", qty, price)),
-                        new_best_offer.map_or("None".to_string(), |(price, qty)| format!("{}@{}", qty, price))
-                    );
-                }
-            }
+        match side {
+            'B' => instrument_market.add_bid(market_state.time_reference, time_offset, price, quantity, &symbol, instrument_info),
+            'S' => instrument_market.add_offer(market_state.time_reference, time_offset, price, quantity, &symbol, instrument_info),
+            _ => warn!("Unknown order side: {}", side),
         }
     }
 }
 
+// TODO: handle time offset
+fn handle_time(market_state: &mut MarketState, message_payload: &[u8], _config: &Config) {
+    // Time message handling can be implemented here if needed
+    let time = u32::from_le_bytes(message_payload[0..4].try_into().unwrap());
+
+    market_state.time_reference = time;
+}
+
 fn handle_add_order_long(market_state: &mut MarketState, message_payload: &[u8], config: &Config) {
-    let _time_offset = u32::from_le_bytes(message_payload[0..4].try_into().unwrap());
+    let time_offset = u32::from_le_bytes(message_payload[0..4].try_into().unwrap());
     let order_id = u64::from_le_bytes(message_payload[4..12].try_into().unwrap());
     let side = message_payload[12] as char;
     let quantity = u32::from_le_bytes(message_payload[13..17].try_into().unwrap());
     let symbol: [u8; 6] = message_payload[17..23].try_into().unwrap();
     let price = u64::from_le_bytes(message_payload[23..31].try_into().unwrap());
 
-    process_add_order(market_state, order_id, side, quantity, symbol, price, config);
+    process_add_order(market_state, time_offset, order_id, side, quantity, symbol, price, config);
 }
 
 fn handle_add_order_short(market_state: &mut MarketState, message_payload: &[u8], config: &Config) {
-    let _time_offset = u32::from_le_bytes(message_payload[0..4].try_into().unwrap());
+    let time_offset = u32::from_le_bytes(message_payload[0..4].try_into().unwrap());
     let order_id = u64::from_le_bytes(message_payload[4..12].try_into().unwrap());
     let side = message_payload[12] as char;
     let quantity: u32 = u16::from_le_bytes(message_payload[13..15].try_into().unwrap()) as u32;
     let symbol: [u8; 6] = message_payload[15..21].try_into().unwrap();
     let price: u64 = u16::from_le_bytes(message_payload[21..23].try_into().unwrap()) as u64;
 
-    process_add_order(market_state, order_id, side, quantity, symbol, price, config);
+    process_add_order(market_state, time_offset, order_id, side, quantity, symbol, price, config);
 }
+
+fn handle_order_executed(_market_state: &mut MarketState, _message_payload: &[u8], _config: &Config) {
+    // Order Executed message handling can be implemented here if needed
+}
+
+fn handle_order_executed_at_price_size(_market_state: &mut MarketState, _message_payload: &[u8], _config: &Config) {
+    // Order Executed At Price Size message handling can be implemented here if needed
+}
+
+fn handle_reduce_size_short(_market_state: &mut MarketState, _message_payload: &[u8], _config: &Config) {
+    // Reduce Size Short message handling can be implemented here if needed
+}
+
+fn handle_modify_order_long(_market_state: &mut MarketState, _message_payload: &[u8], _config: &Config) {
+    // Modify Order Long message handling can be implemented here if needed
+}
+
+fn handle_modify_order_short(_market_state: &mut MarketState, _message_payload: &[u8], _config: &Config) {
+    // Modify Order Short message handling can be implemented here if needed
+}
+
 fn handle_delete_order(market_state: &mut MarketState, message_payload: &[u8], config: &Config) {
-    let _time_offset = u32::from_le_bytes(message_payload[0..4].try_into().unwrap());
+    let time_offset = u32::from_le_bytes(message_payload[0..4].try_into().unwrap());
     let order_id = u64::from_le_bytes(message_payload[4..12].try_into().unwrap());
 
     if !config.summary_only {
@@ -542,52 +752,22 @@ fn handle_delete_order(market_state: &mut MarketState, message_payload: &[u8], c
             let quantity = order.quantity;
             let side = order.side;
 
-            if let Some(instrument_market) = market_state.instrument_markets.get_mut(&symbol) {
-                let old_best_bid = instrument_market.highest_bid();
-                let old_best_offer = instrument_market.lowest_offer();
-
-                instrument_market.remove_quantity(side, price, quantity);
-
-                let new_best_bid = instrument_market.highest_bid();
-                let new_best_offer = instrument_market.lowest_offer();
-
-                if new_best_bid != old_best_bid || new_best_offer != old_best_offer  {
-                    // Log the market state update
-                    if let Some(tob_writer) = &mut market_state.tob_writer {
-                        let bid_qty = new_best_bid.map_or(0, |(_, qty)| qty);
-                        let bid_price = new_best_bid.map_or(0, |(price, _)| price);
-                        let offer_qty = new_best_offer.map_or(0, |(_, qty)| qty);
-                        let offer_price = new_best_offer.map_or(0, |(price, _)| price);
-
-                        let instrument = market_state.symbol_map.get(&symbol);
-                        if Some(instrument).is_none() {
-                            trace!("No symbol mapping found for symbol: {}", String::from_utf8_lossy(&symbol));
-                        }
-                        else {
-                            let instrument = instrument.unwrap();
-                            let osi_root = instrument.osi_root.clone();
-                            let expiry = instrument.expiry.clone();
-                            let call_put = instrument.call_put.unwrap_or(' ');
-                            let strike = instrument.strike;
-
-                            tob_writer.write_record(&[
-                                String::from_utf8_lossy(&symbol).to_string(),
-                                "AddOrder*".to_string(),
-                                osi_root.to_string(),
-                                expiry.to_string(),
-                                call_put.to_string(),
-                                strike.to_string(),
-                                bid_qty.to_string(),
-                                bid_price.to_string(),
-                                offer_qty.to_string(),
-                                offer_price.to_string(),
-                            ]).unwrap();
-                        }
+            if !market_state.filtering || market_state.filtered_symbols.contains(&symbol) {
+                if let Some(instrument_market) = market_state.instrument_markets.get_mut(&symbol) {
+                    let instrument_info = market_state.symbol_map.get(&symbol);
+                    // Ensure writer is set if available
+                    if instrument_market.tob_writer.is_none() {
+                        instrument_market.tob_writer = market_state.tob_writer.clone();
                     }
+                    instrument_market.remove_quantity(market_state.time_reference, time_offset, side, price, quantity, &symbol, instrument_info,);
                 }
             }
         }
     }
+}
+
+fn handle_trade_short(_market_state: &mut MarketState, _message_payload: &[u8], _config: &Config) {
+    // Trade Short message handling can be implemented here if needed
 }
 
 fn handle_symbol_mapping(_market_state: &mut MarketState, message_payload: &[u8], config: &Config) {
@@ -600,17 +780,43 @@ fn handle_symbol_mapping(_market_state: &mut MarketState, message_payload: &[u8]
     }
 }
 
+fn handle_add_order_expanded(_market_state: &mut MarketState, _message_payload: &[u8], _config: &Config) {
+    // Extended Add Order message handling can be implemented here if needed
+    // For now, we will just log that this message type is encountered
+    debug!("Encountered Add Order Extended message (0x2F), handling not implemented.");
+}
+
+fn handle_time_reference(_market_state: &mut MarketState, _message_payload: &[u8], _config: &Config) {
+    // Time Reference message handling can be implemented here if needed
+}
+
+// TODO: handle AuctionCancel (0xAE) and AuctionTrade (0xAF) messages if needed?
 fn dispatch_message(market_state: &mut MarketState, message_type: &u8, message_payload: &[u8], config: &Config) {
     match message_type {
+        0x20 => handle_time(market_state, &message_payload, config),
         0x21 => handle_add_order_long(market_state, &message_payload, config),
         0x22 => handle_add_order_short(market_state, &message_payload, config),
+        0x23 => handle_order_executed(market_state, &message_payload, config),
+        0x24 => handle_order_executed_at_price_size(market_state, &message_payload, config),
+        0x26 => handle_reduce_size_short(market_state, &message_payload, config),
+        0x27 => handle_modify_order_long(market_state, &message_payload, config),
+        0x28 => handle_modify_order_short(market_state, &message_payload, config),
         0x29 => handle_delete_order(market_state, &message_payload, config),
+        0x2b => handle_trade_short(market_state, &message_payload, config),
         0x2e => handle_symbol_mapping(market_state, &message_payload, config),
+        0x2f => handle_add_order_expanded(market_state, &message_payload, config),
+        0xb1 => handle_time_reference(market_state, &message_payload, config),
         _ => { market_state.unsupported_message_types.insert(*message_type); },
     }
 }
 
-fn parse(data: &[u8], symbol_mapping: &HashMap<[u8; 6], SymbolMapping>, filtered_symbols: &HashSet<[u8; 6]>, config: &Config, dump_json: &mut Map<String, Value>) -> io::Result<()> {
+fn parse(
+    data: &[u8],
+    symbol_mapping: &HashMap<[u8; 6], SymbolMapping>,
+    filtered_symbols: &HashSet<[u8; 6]>,
+    config: &Config,
+    dump_json: &mut Map<String, Value>
+) -> io::Result<()> {
     let mut offset = 0;
     let mut market_state = MarketState::new();
     let mut message_stats: HashMap<u8, MessageStats> = HashMap::new();
@@ -620,8 +826,9 @@ fn parse(data: &[u8], symbol_mapping: &HashMap<[u8; 6], SymbolMapping>, filtered
 
     if config.top_of_book_provided {
         let mut wtr = csv::Writer::from_path(&config.top_of_book_file)?;
-        wtr.write_record(&["symbol", "event", "underlying", "type", "strike", "expiry", "bid_qty", "bid_price", "offer_qty", "offer_price"])?;
-        market_state.tob_writer = Some(wtr);
+        wtr.write_record(&["time_ref", "time_offset", "symbol", "event", "underlying", "type", "strike", "expiry", "bid_qty", "bid_price", "offer_price", "offer_qty"])?;
+        // share writer with all InstrumentMarket instances
+        market_state.tob_writer = Some(Rc::new(RefCell::new(wtr)));
     }
 
     debug!("Symbol mapping count: {}", market_state.symbol_map.len());
@@ -687,8 +894,8 @@ fn parse(data: &[u8], symbol_mapping: &HashMap<[u8; 6], SymbolMapping>, filtered
         }
     }
 
-    if let Some(mut writer) = market_state.tob_writer.take() {
-        writer.flush()?;
+    if let Some(rc) = &market_state.tob_writer {
+        rc.borrow_mut().flush()?;
     }
 
     let mut sorted_stats: Vec<_> = message_stats.iter().collect();
