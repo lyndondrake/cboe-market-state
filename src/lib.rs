@@ -22,6 +22,11 @@ use serde_json::{to_writer, json, Map, Value};
 use std::rc::Rc;
 use std::cell::RefCell;
 
+// TODO: paramaterised levels of top-of-book depth
+// TODO: include the relevant details of the message that triggers the row being output
+// TODO: differentiate the messages that trigger the TOB change
+// TODO: paramaterise the top-of-book trigger to be the levels of depth displayed
+
 #[derive(Clone)]
 pub enum SerializationFormat {
     Json,
@@ -446,16 +451,19 @@ impl InstrumentMarket {
         );
     }
 
-    fn modify_quantity(
+    // Renamed from `modify_quantity` and extended to support price changes via `prev_price`
+    fn modify_order(
         &mut self,
         time_reference: u32,
         time_offset: u32,
         side: char,
-        price: u64,
-        new_quantity: u32,
+        prev_price: u64,
+        new_price: u64,
         prev_quantity: u32,
+        new_quantity: u32,
         symbol: &[u8; 6],
         instrument: Option<&SymbolMapping>,
+        event: &str,
     ) {
         let old_best_bid = self.best_bid;
         let old_best_offer = self.best_offer;
@@ -464,32 +472,61 @@ impl InstrumentMarket {
             'B' => &mut self.bids,
             'S' => &mut self.offers,
             _ => {
-                warn!("Unknown order side in modify_quantity: {}", side);
+                warn!("Unknown order side in modify_order: {}", side);
                 return;
             }
         };
 
-        if let Some(level) = price_map.get_mut(&price) {
-            if let Some(pos) = level.iter().position(|&q| q == prev_quantity) {
-                if new_quantity > 0 {
-                    level[pos] = new_quantity;
-                } else {
-                    level.remove(pos);
-                    if level.is_empty() {
-                        price_map.remove(&price);
+        if prev_price == new_price {
+            // Quantity-only change at the same price level
+            if let Some(level) = price_map.get_mut(&new_price) {
+                if let Some(pos) = level.iter().position(|&q| q == prev_quantity) {
+                    if new_quantity > 0 {
+                        level[pos] = new_quantity;
+                    } else {
+                        level.remove(pos);
+                        if level.is_empty() {
+                            price_map.remove(&new_price);
+                        }
                     }
+                } else {
+                    trace!(
+                        "modify_order(same price): no matching prev_quantity {} at price {} for side {}",
+                        prev_quantity, new_price, side
+                    );
                 }
             } else {
                 trace!(
-                    "modify_quantity: no matching prev_quantity {} found at price {} for side {}",
-                    prev_quantity, price, side
+                    "modify_order(same price): no price level {} found for side {}",
+                    new_price, side
                 );
             }
         } else {
-            trace!(
-                "modify_quantity: no price level {} found for side {}",
-                price, side
-            );
+            // Price change: remove from prev_price level, then (optionally) insert at new price
+            let mut removed = false;
+            if let Some(level) = price_map.get_mut(&prev_price) {
+                if let Some(pos) = level.iter().position(|&q| q == prev_quantity) {
+                    level.remove(pos);
+                    removed = true;
+                    if level.is_empty() {
+                        price_map.remove(&prev_price);
+                    }
+                } else {
+                    trace!(
+                        "modify_order(move): no matching prev_quantity {} at prev_price {} for side {}",
+                        prev_quantity, prev_price, side
+                    );
+                }
+            } else {
+                trace!(
+                    "modify_order(move): no prev_price level {} found for side {}",
+                    prev_price, side
+                );
+            }
+
+            if removed && new_quantity > 0 {
+                price_map.entry(new_price).or_insert_with(Vec::new).push(new_quantity);
+            }
         }
 
         let (new_best_bid, new_best_offer) = self.recompute_best();
@@ -502,7 +539,7 @@ impl InstrumentMarket {
             new_best_offer,
             symbol,
             instrument,
-            "ModifySize*",
+            event,
         );
     }
 
@@ -721,25 +758,254 @@ fn handle_add_order_short(market_state: &mut MarketState, message_payload: &[u8]
     process_add_order(market_state, time_offset, order_id, side, quantity, symbol, price, config);
 }
 
-fn handle_order_executed(_market_state: &mut MarketState, _message_payload: &[u8], _config: &Config) {
-    // Order Executed message handling can be implemented here if needed
-}
+// TODO: with all of these, if the order is reduced to 0 quantity, it needs to be removed from the order map too.
+fn handle_order_executed(market_state: &mut MarketState, message_payload: &[u8], config: &Config) {
+    // Offsets per your current stub
+    let time_offset = u32::from_le_bytes(message_payload[0..4].try_into().unwrap());
+    let order_id = u64::from_le_bytes(message_payload[4..12].try_into().unwrap());
+    let executed_quantity = u32::from_le_bytes(message_payload[12..16].try_into().unwrap());
+    let _execution_id = u64::from_le_bytes(message_payload[16..24].try_into().unwrap());
+    let _trade_condition = message_payload[24];
 
-fn handle_order_executed_at_price_size(_market_state: &mut MarketState, _message_payload: &[u8], _config: &Config) {
-    // Order Executed At Price Size message handling can be implemented here if needed
+    if config.summary_only {
+        return;
+    }
+
+    if let Some(order) = market_state.order_map.orders.get_mut(&order_id) {
+        let symbol = order.symbol;
+        let side = order.side;
+        let price = order.price;
+        let prev_qty = order.quantity;
+        let exec = executed_quantity.min(prev_qty);
+        let new_qty = prev_qty.saturating_sub(exec);
+
+        if !market_state.filtering || market_state.filtered_symbols.contains(&symbol) {
+            if let Some(instrument_market) = market_state.instrument_markets.get_mut(&symbol) {
+                // Ensure writer is wired through
+                if instrument_market.tob_writer.is_none() {
+                    instrument_market.tob_writer = market_state.tob_writer.clone();
+                }
+                let instrument_info = market_state.symbol_map.get(&symbol);
+
+                // Execution reduces quantity at the same resting price
+                instrument_market.modify_order(
+                    market_state.time_reference,
+                    time_offset,
+                    side,
+                    price,       // prev_price
+                    price,       // new_price (unchanged)
+                    prev_qty,
+                    new_qty,
+                    &symbol,
+                    instrument_info,
+                    "OrderExecuted",
+                );
+            } else {
+                trace!("OrderExecuted: no InstrumentMarket for {}", String::from_utf8_lossy(&symbol));
+            }
+        }
+
+        if new_qty == 0 {
+            std::mem::drop(order); // release mutable borrow before removing from the map
+            market_state.order_map.remove_order(order_id);
+        } else {
+            order.quantity = new_qty;
+        }
+    } else {
+        trace!("OrderExecuted for unknown order_id: {}", order_id);
+    }
+}
+// ...existing code...
+
+fn handle_order_executed_at_price_size(market_state: &mut MarketState, message_payload: &[u8], config: &Config) {
+    // Offsets per your current stub
+    let time_offset = u32::from_le_bytes(message_payload[0..4].try_into().unwrap());
+    let order_id = u64::from_le_bytes(message_payload[4..12].try_into().unwrap());
+    let executed_quantity = u32::from_le_bytes(message_payload[12..16].try_into().unwrap());
+    let remaining_quantity = u32::from_le_bytes(message_payload[16..20].try_into().unwrap());
+    let _execution_id = u64::from_le_bytes(message_payload[20..28].try_into().unwrap());
+    let _exec_price = u64::from_le_bytes(message_payload[28..36].try_into().unwrap());
+    let _trade_condition = message_payload[36];
+
+    if config.summary_only {
+        return;
+    }
+
+    if let Some(order) = market_state.order_map.orders.get_mut(&order_id) {
+        let symbol = order.symbol;
+        let side = order.side;
+        let price = order.price;
+        let prev_qty = order.quantity;
+
+        // Prefer remaining_quantity if sane; fall back to computed
+        let computed_new = prev_qty.saturating_sub(executed_quantity);
+        let new_qty = if remaining_quantity <= prev_qty {
+            remaining_quantity
+        } else {
+            warn!(
+                "OrderExecutedAtPriceSize: remaining_quantity {} > prev_qty {} for order_id {}. Using computed {}.",
+                remaining_quantity, prev_qty, order_id, computed_new
+            );
+            computed_new
+        };
+
+        if !market_state.filtering || market_state.filtered_symbols.contains(&symbol) {
+            if let Some(instrument_market) = market_state.instrument_markets.get_mut(&symbol) {
+                // Ensure writer is wired through
+                if instrument_market.tob_writer.is_none() {
+                    instrument_market.tob_writer = market_state.tob_writer.clone();
+                }
+                let instrument_info = market_state.symbol_map.get(&symbol);
+
+                // Reduce resting order at its current price
+                instrument_market.modify_order(
+                    market_state.time_reference,
+                    time_offset,
+                    side,
+                    price,     // prev_price
+                    price,     // new_price (unchanged)
+                    prev_qty,
+                    new_qty,
+                    &symbol,
+                    instrument_info,
+                    "OrderExecutedAtPriceSize",
+                );
+            } else {
+                trace!("OrderExecutedAtPriceSize: no InstrumentMarket for {}", String::from_utf8_lossy(&symbol));
+            }
+        }
+
+        if new_qty == 0 {
+            std::mem::drop(order); // release mutable borrow before removal
+            market_state.order_map.remove_order(order_id);
+        } else {
+            order.quantity = new_qty;
+        }
+    } else {
+        trace!("OrderExecutedAtPriceSize for unknown order_id: {}", order_id);
+    }
 }
 
 fn handle_reduce_size_short(_market_state: &mut MarketState, _message_payload: &[u8], _config: &Config) {
-    // Reduce Size Short message handling can be implemented here if needed
+    let _time_offset = u32::from_le_bytes(_message_payload[0..4].try_into().unwrap());
+    let _order_id = u64::from_le_bytes(_message_payload[4..12].try_into().unwrap());
+    let _cancelled_quantity = u16::from_le_bytes(_message_payload[12..14].try_into().unwrap()) as u32;
+
 }
 
-fn handle_modify_order_long(_market_state: &mut MarketState, _message_payload: &[u8], _config: &Config) {
-    // Modify Order Long message handling can be implemented here if needed
+// ...existing code...
+fn handle_modify_order_long(market_state: &mut MarketState, message_payload: &[u8], config: &Config) {
+    let time_offset = u32::from_le_bytes(message_payload[0..4].try_into().unwrap());
+    let order_id = u64::from_le_bytes(message_payload[4..12].try_into().unwrap());
+    let new_quantity = u32::from_le_bytes(message_payload[12..16].try_into().unwrap());
+    let new_price = u64::from_le_bytes(message_payload[16..24].try_into().unwrap());
+    let _modify_flags = message_payload[24];
+
+    if config.summary_only {
+        return;
+    }
+
+    if let Some(order) = market_state.order_map.orders.get_mut(&order_id) {
+        let symbol = order.symbol;
+        let side = order.side;
+        let prev_price = order.price;
+        let prev_quantity = order.quantity;
+
+        if !market_state.filtering || market_state.filtered_symbols.contains(&symbol) {
+            let instrument_info = market_state.symbol_map.get(&symbol);
+            let instrument_market = match market_state.instrument_markets.entry(symbol) {
+                Entry::Occupied(e) => {
+                    let im = e.into_mut();
+                    if im.tob_writer.is_none() {
+                        im.tob_writer = market_state.tob_writer.clone();
+                    }
+                    im
+                }
+                Entry::Vacant(v) => v.insert(InstrumentMarket::new_with_writer(market_state.tob_writer.clone())),
+            };
+
+            instrument_market.modify_order(
+                market_state.time_reference,
+                time_offset,
+                side,
+                prev_price,
+                new_price,
+                prev_quantity,
+                new_quantity,
+                &symbol,
+                instrument_info,
+                "ModifyOrderLong",
+            );
+        }
+
+        if new_quantity == 0 {
+            drop(order);
+            market_state.order_map.remove_order(order_id);
+        } else {
+            order.price = new_price;
+            order.quantity = new_quantity;
+        }
+    } else {
+        trace!("ModifyOrderLong for unknown order_id: {}", order_id);
+    }
 }
 
-fn handle_modify_order_short(_market_state: &mut MarketState, _message_payload: &[u8], _config: &Config) {
-    // Modify Order Short message handling can be implemented here if needed
+fn handle_modify_order_short(market_state: &mut MarketState, message_payload: &[u8], config: &Config) {
+    let time_offset = u32::from_le_bytes(message_payload[0..4].try_into().unwrap());
+    let order_id = u64::from_le_bytes(message_payload[4..12].try_into().unwrap());
+    let new_quantity = u16::from_le_bytes(message_payload[12..14].try_into().unwrap()) as u32;
+    let new_price = u16::from_le_bytes(message_payload[14..16].try_into().unwrap()) as u64;
+    let _modify_flags = message_payload[16];
+
+    if config.summary_only {
+        return;
+    }
+
+    if let Some(order) = market_state.order_map.orders.get_mut(&order_id) {
+        let symbol = order.symbol;
+        let side = order.side;
+        let prev_price = order.price;
+        let prev_quantity = order.quantity;
+
+        if !market_state.filtering || market_state.filtered_symbols.contains(&symbol) {
+            let instrument_info = market_state.symbol_map.get(&symbol);
+            let instrument_market = match market_state.instrument_markets.entry(symbol) {
+                Entry::Occupied(e) => {
+                    let im = e.into_mut();
+                    if im.tob_writer.is_none() {
+                        im.tob_writer = market_state.tob_writer.clone();
+                    }
+                    im
+                }
+                Entry::Vacant(v) => v.insert(InstrumentMarket::new_with_writer(market_state.tob_writer.clone())),
+            };
+
+            instrument_market.modify_order(
+                market_state.time_reference,
+                time_offset,
+                side,
+                prev_price,
+                new_price,
+                prev_quantity,
+                new_quantity,
+                &symbol,
+                instrument_info,
+                "ModifyOrderShort",
+            );
+        }
+
+        if new_quantity == 0 {
+            drop(order);
+            market_state.order_map.remove_order(order_id);
+        } else {
+            order.price = new_price;
+            order.quantity = new_quantity;
+        }
+    } else {
+        trace!("ModifyOrderShort for unknown order_id: {}", order_id);
+    }
 }
+//
 
 fn handle_delete_order(market_state: &mut MarketState, message_payload: &[u8], config: &Config) {
     let time_offset = u32::from_le_bytes(message_payload[0..4].try_into().unwrap());

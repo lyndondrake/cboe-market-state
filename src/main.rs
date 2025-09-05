@@ -48,8 +48,8 @@ struct Args {
     symbol_map_file: Option<String>,
 
     /// Name of underlying
-    #[arg(short = 'r', long = "osi-root", value_name = "OSI_ROOT")]
-    osi_root: Option<String>,
+    #[arg(short = 'u', long = "underlying", value_name = "UNDERLYING")]
+    underlying: Option<String>,
 
     /// Type of option
     #[arg(short = 't', long = "option-type", value_name = "OPTION_TYPE" )]
@@ -63,6 +63,12 @@ struct Args {
     #[arg(short = 'e', long = "expiry-date", value_name = "OPTION_EXPIRY_DATE")]
     option_expiry_date: Option<String>,
 
+    /// Reference date
+    /// This is the date used to interpret time offsets in the message file.
+    /// It should be the date the messages were captured.
+    #[arg(short = 'r', long = "reference-date", value_name = "REFERENCE_DATE")]
+    reference_date: Option<String>,
+
     /// Input file
     file: String,
 }
@@ -75,7 +81,7 @@ fn main() {
     let args = Args::parse();
 
     // Check for underlying without instruments_file
-    if args.osi_root.is_some() && args.symbol_map_file.is_none() {
+    if args.underlying.is_some() && args.symbol_map_file.is_none() {
         error!("Error: --osi-root (-r) requires --symbol-map-file (-m) to also be specified.");
         process::exit(1);
     }
@@ -103,8 +109,8 @@ fn main() {
         args.quick_summary_only,
         args.symbol_map_file.is_some(),
         args.symbol_map_file.as_deref().unwrap_or("").to_string(),
-        args.osi_root.is_some(),
-        args.osi_root.as_deref().unwrap_or("").to_string(),
+        args.underlying.is_some(),
+        args.underlying.as_deref().unwrap_or("").to_string(),
         args.dump_file.is_some(),
         args.dump_file.as_deref().unwrap_or("").to_string(),
         args.top_of_book_file.is_some(),
