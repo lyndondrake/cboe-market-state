@@ -356,8 +356,7 @@ impl InstrumentMarket {
     }
 
     // Centralized TOB emission helper. Also updates stored bests.
-    // TODO: split into separate emit and update functions?
-    // TODO: output time in CSV as full date time + fractional seconds
+    // Now emits when ANY of the top-5 levels change on either side.
     fn maybe_emit_tob_change(
         &mut self,
         time_reference: u32,
@@ -366,12 +365,19 @@ impl InstrumentMarket {
         old_best_offer: Option<(u64, u32)>,
         new_best_bid: Option<(u64, u32)>,
         new_best_offer: Option<(u64, u32)>,
+        old_top_bids: &[(u64, u32)],
+        old_top_offers: &[(u64, u32)],
         symbol: &[u8; 6],
         instrument: Option<&SymbolMapping>,
         event: &str,
         reason: &str,
     ) {
-        if new_best_bid != old_best_bid || new_best_offer != old_best_offer {
+        // Emit if bests changed OR any of the cached top-5 levels changed
+        if new_best_bid != old_best_bid
+            || new_best_offer != old_best_offer
+            || self.top_bids.as_slice() != old_top_bids
+            || self.top_offers.as_slice() != old_top_offers
+        {
             if let Some(instr) = instrument {
                 let (bid_price_str, bid_qty_str) = if let Some((price, qty)) = new_best_bid {
                     (price.to_string(), qty.to_string())
@@ -391,8 +397,7 @@ impl InstrumentMarket {
                     let call_put = instr.call_put.unwrap_or(' ');
                     let strike = instr.strike;
 
-                    // Build top-5 bid fields in header order: bid4, bid3, bid2, bid1, bid0
-                    // Each bid field pair is (qty, price). Empty strings when missing.
+                    // Build top-5 bid fields: bid4..bid0 pairs (qty, price)
                     let mut bid_fields: Vec<String> = Vec::with_capacity(10);
                     for level in (0..5).rev() {
                         if let Some((price, qty)) = self.top_bids.get(level).copied() {
@@ -404,8 +409,7 @@ impl InstrumentMarket {
                         }
                     }
 
-                    // Build top-5 offer fields in header order: offer0..offer4
-                    // Each offer field pair is (price, qty). Empty strings when missing.
+                    // Build top-5 offer fields: offer0..offer4 pairs (price, qty)
                     let mut offer_fields: Vec<String> = Vec::with_capacity(10);
                     for level in 0..5 {
                         if let Some((price, qty)) = self.top_offers.get(level).copied() {
@@ -466,6 +470,8 @@ impl InstrumentMarket {
     ) {
         let old_best_bid = self.best_bid;
         let old_best_offer = self.best_offer;
+        let prev_top_bids = self.top_bids.clone();
+        let prev_top_offers = self.top_offers.clone();
 
         self.bids.entry(price).or_insert_with(Vec::new).push(quantity);
 
@@ -478,6 +484,8 @@ impl InstrumentMarket {
             old_best_offer,
             new_best_bid,
             new_best_offer,
+            &prev_top_bids,
+            &prev_top_offers,
             symbol,
             instrument,
             event,
@@ -500,6 +508,8 @@ impl InstrumentMarket {
     ) {
         let old_best_bid = self.best_bid;
         let old_best_offer = self.best_offer;
+        let prev_top_bids = self.top_bids.clone();
+        let prev_top_offers = self.top_offers.clone();
 
         self.offers.entry(price).or_insert_with(Vec::new).push(quantity);
 
@@ -512,6 +522,8 @@ impl InstrumentMarket {
             old_best_offer,
             new_best_bid,
             new_best_offer,
+            &prev_top_bids,
+            &prev_top_offers,
             symbol,
             instrument,
             event,
@@ -522,7 +534,6 @@ impl InstrumentMarket {
         self.best_offer = new_best_offer;
     }
 
-    // Renamed from `modify_quantity` and extended to support price changes via `prev_price`
     fn modify_order(
         &mut self,
         time_reference: u32,
@@ -538,6 +549,8 @@ impl InstrumentMarket {
     ) {
         let old_best_bid = self.best_bid;
         let old_best_offer = self.best_offer;
+        let prev_top_bids = self.top_bids.clone();
+        let prev_top_offers = self.top_offers.clone();
 
         let price_map = match side {
             'B' => &mut self.bids,
@@ -609,6 +622,8 @@ impl InstrumentMarket {
             old_best_offer,
             new_best_bid,
             new_best_offer,
+            &prev_top_bids,
+            &prev_top_offers,
             symbol,
             instrument,
             event,
@@ -632,6 +647,8 @@ impl InstrumentMarket {
     ) {
         let old_best_bid = self.best_bid;
         let old_best_offer = self.best_offer;
+        let prev_top_bids = self.top_bids.clone();
+        let prev_top_offers = self.top_offers.clone();
 
         let price_map = match side {
             'B' => &mut self.bids,
@@ -660,6 +677,8 @@ impl InstrumentMarket {
             old_best_offer,
             new_best_bid,
             new_best_offer,
+            &prev_top_bids,
+            &prev_top_offers,
             symbol,
             instrument,
             event,
