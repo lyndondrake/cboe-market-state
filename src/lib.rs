@@ -703,6 +703,8 @@ struct MarketState {
     pub tob_writer: Option<Rc<RefCell<Writer<std::fs::File>>>>, // changed to shared handle
     add_messages_count: usize,
     time_reference: u32,
+    #[serde(skip)] // do not persist counts in saved state; we dump them separately if needed
+    symbol_message_counts: HashMap<[u8; 6], u64>,
 }
 
 impl MarketState {
@@ -718,7 +720,14 @@ impl MarketState {
             tob_writer: None,
             add_messages_count: 0,
             time_reference: 0,
+            symbol_message_counts: HashMap::new(),
         }
+    }
+
+    #[inline]
+    fn bump_symbol_count(&mut self, symbol: &[u8; 6]) {
+        let entry = self.symbol_message_counts.entry(*symbol).or_insert(0);
+        *entry = entry.saturating_add(1);
     }
 
     fn save_to_file(&self, file_path: &str, format: SerializationFormat) -> Result<(), Box<dyn Error>> {
@@ -801,6 +810,7 @@ fn process_add_order(
     market_state.unique_symbols.insert(symbol);
 
     if !config.summary_only && (!market_state.filtering || market_state.filtered_symbols.contains(&symbol)) {
+        market_state.bump_symbol_count(&symbol);
         if market_state.add_messages_count > config.limit && config.limit > 0 {
             return;
         }
@@ -1280,6 +1290,37 @@ fn parse(
             );
         }
     }
+
+    // per-instrument message counts (expiry, strike, type), sorted
+    let mut rows: Vec<(String, f64, String, u64)> = market_state
+        .symbol_message_counts
+        .iter()
+        .map(|(sym, cnt)| {
+            if let Some(instr) = market_state.symbol_map.get(sym) {
+                (
+                    instr.expiry.clone(),
+                    instr.strike,
+                    instr.call_put.map(|c| c.to_string()).unwrap_or_default(),
+                    *cnt,
+                )
+            } else {
+                // No mapping found; leave fields blank except count
+                ("".to_string(), 0.0, String::new(), *cnt)
+            }
+        })
+        .collect();
+
+    rows.sort_by(|a, b| {
+        a.0.cmp(&b.0) // expiry
+            .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)) // strike
+            .then(a.2.cmp(&b.2)) // type
+    });
+
+            // Print per-instrument message counts instead of dumping to JSON
+    info!("Per-instrument message counts (expiry, strike, type, count):");
+    for (expiry, strike, typ, count) in rows {
+        info!("{}, {}, {}, {}", expiry, strike, typ, count.to_formatted_string(&Locale::en));
+    }    
 
     // Insert into dump_json if dumping is enabled
     if config.dump_file_provided {
