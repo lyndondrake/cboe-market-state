@@ -8,5 +8,6 @@ Cargo.lock
 dump-2023-10-23.json
 dump.json
 test.txt
-tob-init.csv
-tob.csv
+*.csv
+*.csv.gz
+.DS_Store

@@ -24,8 +24,10 @@ use std::cell::RefCell;
 
 // TODO: paramaterised levels of top-of-book depth
 // TODO: include the relevant details of the message that triggers the row being output
-// TODO: differentiate the messages that trigger the TOB change
+// DONE: differentiate the messages that trigger the TOB change
 // TODO: paramaterise the top-of-book trigger to be the levels of depth displayed
+// TODO: still a few unimplemented message types
+
 
 #[derive(Clone)]
 pub enum SerializationFormat {
@@ -339,6 +341,7 @@ impl InstrumentMarket {
         symbol: &[u8; 6],
         instrument: Option<&SymbolMapping>,
         event: &str,
+        reason: &str,
     ) {
         if new_best_bid != old_best_bid || new_best_offer != old_best_offer {
             if let Some(instr) = instrument {
@@ -373,6 +376,7 @@ impl InstrumentMarket {
                         bid_price_str,
                         offer_price_str,
                         offer_qty_str,
+                        reason.to_string(),
                     ]).unwrap();
                 }
 
@@ -403,6 +407,7 @@ impl InstrumentMarket {
         quantity: u32,
         symbol: &[u8; 6],
         instrument: Option<&SymbolMapping>,
+        event: &str,
     ) {
         let old_best_bid = self.best_bid;
         let old_best_offer = self.best_offer;
@@ -410,6 +415,7 @@ impl InstrumentMarket {
         self.bids.entry(price).or_insert_with(Vec::new).push(quantity);
 
         let (new_best_bid, new_best_offer) = self.recompute_best();
+        let reason = format!("bid {}@{}", quantity, price);
         self.maybe_emit_tob_change(
             time_reference,
             time_offset,
@@ -419,7 +425,8 @@ impl InstrumentMarket {
             new_best_offer,
             symbol,
             instrument,
-            "AddOrder*",
+            event,
+            &reason,
         );
     }
 
@@ -431,6 +438,7 @@ impl InstrumentMarket {
         quantity: u32,
         symbol: &[u8; 6],
         instrument: Option<&SymbolMapping>,
+        event: &str,
     ) {
         let old_best_bid = self.best_bid;
         let old_best_offer = self.best_offer;
@@ -438,6 +446,7 @@ impl InstrumentMarket {
         self.offers.entry(price).or_insert_with(Vec::new).push(quantity);
 
         let (new_best_bid, new_best_offer) = self.recompute_best();
+        let reason = format!("bid {}@{}", quantity, price);
         self.maybe_emit_tob_change(
             time_reference,
             time_offset,
@@ -447,7 +456,8 @@ impl InstrumentMarket {
             new_best_offer,
             symbol,
             instrument,
-            "AddOrder*",
+            event,
+            &reason,
         );
     }
 
@@ -530,6 +540,7 @@ impl InstrumentMarket {
         }
 
         let (new_best_bid, new_best_offer) = self.recompute_best();
+        let reason = format!("modify {}@{} to {}@{}", prev_quantity, prev_price, new_quantity, new_price);
         self.maybe_emit_tob_change(
             time_reference,
             time_offset,
@@ -540,6 +551,7 @@ impl InstrumentMarket {
             symbol,
             instrument,
             event,
+            &reason,
         );
     }
 
@@ -552,6 +564,7 @@ impl InstrumentMarket {
         quantity: u32,
         symbol: &[u8; 6],
         instrument: Option<&SymbolMapping>,
+        event: &str,
     ) {
         let old_best_bid = self.best_bid;
         let old_best_offer = self.best_offer;
@@ -575,6 +588,7 @@ impl InstrumentMarket {
         }
 
         let (new_best_bid, new_best_offer) = self.recompute_best();
+        let reason = format!("remove {}@{}", quantity, price);
         self.maybe_emit_tob_change(
             time_reference,
             time_offset,
@@ -584,7 +598,8 @@ impl InstrumentMarket {
             new_best_offer,
             symbol,
             instrument,
-            "DeleteOrder",
+            event,
+            &reason,
         );
     }
 }
@@ -695,6 +710,7 @@ fn process_add_order(
     symbol: [u8; 6],
     price: u64,
     config: &Config,
+    event: &str,
 ) {
     market_state.unique_symbols.insert(symbol);
 
@@ -721,8 +737,8 @@ fn process_add_order(
         };
 
         match side {
-            'B' => instrument_market.add_bid(market_state.time_reference, time_offset, price, quantity, &symbol, instrument_info),
-            'S' => instrument_market.add_offer(market_state.time_reference, time_offset, price, quantity, &symbol, instrument_info),
+            'B' => instrument_market.add_bid(market_state.time_reference, time_offset, price, quantity, &symbol, instrument_info, event, ),
+            'S' => instrument_market.add_offer(market_state.time_reference, time_offset, price, quantity, &symbol, instrument_info, event, ),
             _ => warn!("Unknown order side: {}", side),
         }
     }
@@ -744,7 +760,7 @@ fn handle_add_order_long(market_state: &mut MarketState, message_payload: &[u8],
     let symbol: [u8; 6] = message_payload[17..23].try_into().unwrap();
     let price = u64::from_le_bytes(message_payload[23..31].try_into().unwrap());
 
-    process_add_order(market_state, time_offset, order_id, side, quantity, symbol, price, config);
+    process_add_order(market_state, time_offset, order_id, side, quantity, symbol, price, config, "AddOrderLong");
 }
 
 fn handle_add_order_short(market_state: &mut MarketState, message_payload: &[u8], config: &Config) {
@@ -755,7 +771,7 @@ fn handle_add_order_short(market_state: &mut MarketState, message_payload: &[u8]
     let symbol: [u8; 6] = message_payload[15..21].try_into().unwrap();
     let price: u64 = u16::from_le_bytes(message_payload[21..23].try_into().unwrap()) as u64;
 
-    process_add_order(market_state, time_offset, order_id, side, quantity, symbol, price, config);
+    process_add_order(market_state, time_offset, order_id, side, quantity, symbol, price, config, "AddOrderShort");
 }
 
 // TODO: with all of these, if the order is reduced to 0 quantity, it needs to be removed from the order map too.
@@ -893,7 +909,6 @@ fn handle_reduce_size_short(_market_state: &mut MarketState, _message_payload: &
 
 }
 
-// ...existing code...
 fn handle_modify_order_long(market_state: &mut MarketState, message_payload: &[u8], config: &Config) {
     let time_offset = u32::from_le_bytes(message_payload[0..4].try_into().unwrap());
     let order_id = u64::from_le_bytes(message_payload[4..12].try_into().unwrap());
@@ -1025,7 +1040,7 @@ fn handle_delete_order(market_state: &mut MarketState, message_payload: &[u8], c
                     if instrument_market.tob_writer.is_none() {
                         instrument_market.tob_writer = market_state.tob_writer.clone();
                     }
-                    instrument_market.remove_quantity(market_state.time_reference, time_offset, side, price, quantity, &symbol, instrument_info,);
+                    instrument_market.remove_quantity(market_state.time_reference, time_offset, side, price, quantity, &symbol, instrument_info, "DeleteOrder");
                 }
             }
         }
@@ -1092,7 +1107,7 @@ fn parse(
 
     if config.top_of_book_provided {
         let mut wtr = csv::Writer::from_path(&config.top_of_book_file)?;
-        wtr.write_record(&["time_ref", "time_offset", "symbol", "event", "underlying", "type", "strike", "expiry", "bid_qty", "bid_price", "offer_price", "offer_qty"])?;
+        wtr.write_record(&["time_ref", "time_offset", "symbol", "event", "underlying", "type", "strike", "expiry", "bid4_qty", "bid4_price", "bid3_qty", "bid3_price", "bid2_qty", "bid2_price", "bid1_qty", "bid1_price", "bid0_qty", "bid0_price", "offer0_price", "offer0_qty", "offer1_price", "offer1_qty", "offer2_price", "offer2_qty", "offer3_price", "offer3_qty", "offer4_price", "offer4_qty","reason"])?;
         // share writer with all InstrumentMarket instances
         market_state.tob_writer = Some(Rc::new(RefCell::new(wtr)));
     }
