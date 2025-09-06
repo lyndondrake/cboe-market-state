@@ -285,6 +285,11 @@ struct InstrumentMarket {
     best_bid: Option<(u64, u32)>,
     #[serde(skip)]
     best_offer: Option<(u64, u32)>,
+    // Maintain top-5 levels
+    #[serde(skip)]
+    top_bids: Vec<(u64, u32)>,
+    #[serde(skip)]
+    top_offers: Vec<(u64, u32)>,
 }
 
 impl InstrumentMarket {
@@ -303,6 +308,8 @@ impl InstrumentMarket {
             tob_writer,
             best_bid: None,
             best_offer: None,
+            top_bids: Vec::new(),
+            top_offers: Vec::new(),
         }
     }
 
@@ -322,9 +329,30 @@ impl InstrumentMarket {
             .map(|(price, qtys)| (*price, qtys.iter().copied().sum()))
     }
 
-    // Recompute bests from the books
-    fn recompute_best(&self) -> (Option<(u64, u32)>, Option<(u64, u32)>) {
-        (self.highest_bid(), self.lowest_offer())
+    // Recompute top-5 levels from the books and update cached bests
+    fn recompute_top(&mut self) -> (Option<(u64, u32)>, Option<(u64, u32)>) {
+        // Highest 5 bid levels (iterate from the back of the BTreeMap)
+        self.top_bids = self
+            .bids
+            .iter()
+            .rev()
+            .take(5)
+            .map(|(price, qtys)| (*price, qtys.iter().copied().sum()))
+            .collect();
+
+        // Lowest 5 offer levels (iterate from the front)
+        self.top_offers = self
+            .offers
+            .iter()
+            .take(5)
+            .map(|(price, qtys)| (*price, qtys.iter().copied().sum()))
+            .collect();
+
+        // Update bests from the first of each list
+        let new_best_bid = self.top_bids.get(0).copied();
+        let new_best_offer = self.top_offers.get(0).copied();
+
+        (new_best_bid, new_best_offer)
     }
 
     // Centralized TOB emission helper. Also updates stored bests.
@@ -363,21 +391,48 @@ impl InstrumentMarket {
                     let call_put = instr.call_put.unwrap_or(' ');
                     let strike = instr.strike;
 
-                    wtr.write_record(&[
-                        time_reference.to_string(),
-                        time_offset.to_string(),
-                        String::from_utf8_lossy(symbol).to_string(),
-                        event.to_string(),
-                        osi_root.to_string(),
-                        expiry.to_string(),
-                        call_put.to_string(),
-                        strike.to_string(),
-                        bid_qty_str,
-                        bid_price_str,
-                        offer_price_str,
-                        offer_qty_str,
-                        reason.to_string(),
-                    ]).unwrap();
+                    // Build top-5 bid fields in header order: bid4, bid3, bid2, bid1, bid0
+                    // Each bid field pair is (qty, price). Empty strings when missing.
+                    let mut bid_fields: Vec<String> = Vec::with_capacity(10);
+                    for level in (0..5).rev() {
+                        if let Some((price, qty)) = self.top_bids.get(level).copied() {
+                            bid_fields.push(qty.to_string());
+                            bid_fields.push(price.to_string());
+                        } else {
+                            bid_fields.push(String::new());
+                            bid_fields.push(String::new());
+                        }
+                    }
+
+                    // Build top-5 offer fields in header order: offer0..offer4
+                    // Each offer field pair is (price, qty). Empty strings when missing.
+                    let mut offer_fields: Vec<String> = Vec::with_capacity(10);
+                    for level in 0..5 {
+                        if let Some((price, qty)) = self.top_offers.get(level).copied() {
+                            offer_fields.push(price.to_string());
+                            offer_fields.push(qty.to_string());
+                        } else {
+                            offer_fields.push(String::new());
+                            offer_fields.push(String::new());
+                        }
+                    }
+
+                    // Write the row in the same order as the CSV headers
+                    let mut row: Vec<String> = Vec::with_capacity(4 + 4 + 10 + 10 + 1);
+                    row.push(time_reference.to_string());
+                    row.push(time_offset.to_string());
+                    row.push(String::from_utf8_lossy(symbol).to_string());
+                    row.push(event.to_string());
+                    row.push(osi_root.to_string());     // underlying
+                    row.push(call_put.to_string());     // type
+                    row.push(strike.to_string());       // strike
+                    row.push(expiry.to_string());       // expiry
+
+                    row.extend(bid_fields);
+                    row.extend(offer_fields);
+                    row.push(reason.to_string());
+
+                    wtr.write_record(&row).unwrap();
                 }
 
                 trace!(
@@ -414,7 +469,7 @@ impl InstrumentMarket {
 
         self.bids.entry(price).or_insert_with(Vec::new).push(quantity);
 
-        let (new_best_bid, new_best_offer) = self.recompute_best();
+        let (new_best_bid, new_best_offer) = self.recompute_top();
         let reason = format!("bid {}@{}", quantity, price);
         self.maybe_emit_tob_change(
             time_reference,
@@ -428,6 +483,9 @@ impl InstrumentMarket {
             event,
             &reason,
         );
+        // Persist the new bests after emit
+        self.best_bid = new_best_bid;
+        self.best_offer = new_best_offer;
     }
 
     fn add_offer(
@@ -445,8 +503,8 @@ impl InstrumentMarket {
 
         self.offers.entry(price).or_insert_with(Vec::new).push(quantity);
 
-        let (new_best_bid, new_best_offer) = self.recompute_best();
-        let reason = format!("bid {}@{}", quantity, price);
+        let (new_best_bid, new_best_offer) = self.recompute_top();
+        let reason = format!("offer {}@{}", quantity, price);
         self.maybe_emit_tob_change(
             time_reference,
             time_offset,
@@ -459,6 +517,9 @@ impl InstrumentMarket {
             event,
             &reason,
         );
+        // Persist the new bests after emit
+        self.best_bid = new_best_bid;
+        self.best_offer = new_best_offer;
     }
 
     // Renamed from `modify_quantity` and extended to support price changes via `prev_price`
@@ -539,7 +600,7 @@ impl InstrumentMarket {
             }
         }
 
-        let (new_best_bid, new_best_offer) = self.recompute_best();
+        let (new_best_bid, new_best_offer) = self.recompute_top();
         let reason = format!("modify {}@{} to {}@{}", prev_quantity, prev_price, new_quantity, new_price);
         self.maybe_emit_tob_change(
             time_reference,
@@ -553,6 +614,9 @@ impl InstrumentMarket {
             event,
             &reason,
         );
+        // Persist the new bests after emit
+        self.best_bid = new_best_bid;
+        self.best_offer = new_best_offer;
     }
 
     fn remove_quantity(
@@ -587,7 +651,7 @@ impl InstrumentMarket {
             }
         }
 
-        let (new_best_bid, new_best_offer) = self.recompute_best();
+        let (new_best_bid, new_best_offer) = self.recompute_top();
         let reason = format!("remove {}@{}", quantity, price);
         self.maybe_emit_tob_change(
             time_reference,
@@ -601,6 +665,9 @@ impl InstrumentMarket {
             event,
             &reason,
         );
+        // Persist the new bests after emit
+        self.best_bid = new_best_bid;
+        self.best_offer = new_best_offer;
     }
 }
 #[derive(Serialize, Deserialize)]
